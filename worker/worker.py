@@ -3,6 +3,9 @@ from __future__ import annotations
 import json
 import time
 from datetime import datetime
+import threading
+
+from matplotlib.pyplot import step
 
 import redis
 
@@ -20,20 +23,33 @@ r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 def now():
     return datetime.utcnow()
 
+def run_with_timeout(fn, inp: dict, timeout_sec: float):
+    """
+    Runs a tool function with timeout using a thread.
+    Returns (output_dict, error_str).
+    """
+    result_container = {"out": None, "err": None}
+
+    def target():
+        try:
+            out, err = fn(inp)
+            result_container["out"] = out
+            result_container["err"] = err
+        except Exception as e:
+            result_container["err"] = str(e)
+
+    t = threading.Thread(target=target)
+    t.start()
+    t.join(timeout=timeout_sec)
+
+    if t.is_alive():
+        return {}, f"tool timeout after {timeout_sec}s"
+
+    return result_container["out"], result_container["err"]
 
 def run_job(job_id: int) -> None:
     db = SessionLocal()
     try:
-        # job = db.query(Job).filter(Job.id == job_id).first()
-        # if not job:
-        #     print(f"[Worker] Job {job_id} not found. Skipping.")
-        #     return
-
-        # # Mark job running
-        # job.status = JobStatus.RUNNING.value
-        # job.updated_at = now()
-        # db.commit()
-        
         # Atomic claim: only one worker can move QUEUED -> RUNNING
         stmt = (
             update(Job)
@@ -60,8 +76,10 @@ def run_job(job_id: int) -> None:
         step = Step(
             job_id=job.id,
             status=StepStatus.PENDING.value,
-            tool_name="echo",
-            input_json=json.dumps({"request_text": job.request_text}),
+            # tool_name="echo",
+            tool_name="unstable",
+            # input_json=json.dumps({"request_text": job.request_text}),
+            input_json=json.dumps({"sleep_sec": 0.5, "fail_prob": 0.7}),
             created_at=now(),
             updated_at=now(),
         )
@@ -79,30 +97,45 @@ def run_job(job_id: int) -> None:
             raise RuntimeError(f"Unknown tool: {step.tool_name}")
 
         inp = json.loads(step.input_json) if step.input_json else {}
-        out, err = tool(inp)
 
-        if err:
+        MAX_RETRIES = 3
+        TIMEOUT_SEC = 2.0
+
+        attempt = 0
+        success = False
+        last_error = None
+
+        while attempt < MAX_RETRIES:
+            attempt += 1
+            print(f"[Worker] Job {job_id} Step {step.id} attempt {attempt}")
+
+            out, err = run_with_timeout(tool, inp, TIMEOUT_SEC)
+
+            if err is None:
+                success = True
+                break
+
+            last_error = err
+            print(f"[Worker] Attempt {attempt} failed: {err}")
+            time.sleep(0.5 * attempt)  # simple backoff
+
+        if not success:
             step.status = StepStatus.FAILED.value
-            step.error_message = err
+            step.error_message = last_error
             step.updated_at = now()
 
             job.status = JobStatus.FAILED.value
-            job.error_message = f"Tool {step.tool_name} failed: {err}"
+            job.error_message = f"Tool {step.tool_name} failed after retries: {last_error}"
             job.updated_at = now()
+
             db.commit()
             return
 
+        # Success
         step.output_json = json.dumps(out)
         step.status = StepStatus.SUCCEEDED.value
         step.updated_at = now()
 
-        # Finalize job
-        job.result_text = json.dumps(out, indent=2)
-        job.status = JobStatus.SUCCEEDED.value
-        job.updated_at = now()
-
-        db.commit()
-        print(f"[Worker] Job {job_id} succeeded.")
     except Exception as e:
         # Hard failure: mark job failed
         job = db.query(Job).filter(Job.id == job_id).first()

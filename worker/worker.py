@@ -73,73 +73,95 @@ def run_job(job_id: int) -> None:
         job = db.query(Job).filter(Job.id == job_id).first()
 
         # For MVP: define a fixed workflow = one step: echo
-        step = Step(
-            job_id=job.id,
-            status=StepStatus.PENDING.value,
-            # tool_name="echo",
-            tool_name="unstable",
-            # input_json=json.dumps({"request_text": job.request_text}),
-            input_json=json.dumps({"sleep_sec": 0.5, "fail_prob": 0.7}),
-            created_at=now(),
-            updated_at=now(),
-        )
-        db.add(step)
-        db.commit()
-        db.refresh(step)
+        # Define workflow plan (static for now)
+        workflow_plan = [
+            {
+                "tool_name": "echo",
+                "input": {"text": job.request_text}
+            },
+            {
+                "tool_name": "unstable",
+                "input": {"sleep_sec": 0.5, "fail_prob": 0.3}
+            },
+            {
+                "tool_name": "echo",
+                "input": {"final": "processing completed"}
+            }
+        ]
+        previous_output = None
 
-        # Run step
-        step.status = StepStatus.RUNNING.value
-        step.updated_at = now()
-        db.commit()
+        for step_def in workflow_plan:
+            step = Step(
+                job_id=job.id,
+                status=StepStatus.PENDING.value,
+                tool_name=step_def["tool_name"],
+                input_json=json.dumps(step_def["input"]),
+                created_at=now(),
+                updated_at=now(),
+            )
+            db.add(step)
+            db.commit()
+            db.refresh(step)
 
-        tool = get_tool(step.tool_name)
-        if tool is None:
-            raise RuntimeError(f"Unknown tool: {step.tool_name}")
-
-        inp = json.loads(step.input_json) if step.input_json else {}
-
-        MAX_RETRIES = 3
-        TIMEOUT_SEC = 2.0
-
-        attempt = 0
-        success = False
-        last_error = None
-
-        while attempt < MAX_RETRIES:
-            attempt += 1
-            print(f"[Worker] Job {job_id} Step {step.id} attempt {attempt}")
-
-             # HEARTBEAT: show progress so reaper doesn't kill active jobs
-            job.updated_at = now()
+            # Run this step using existing retry + timeout logic
+            step.status = StepStatus.RUNNING.value
             step.updated_at = now()
             db.commit()
 
-            out, err = run_with_timeout(tool, inp, TIMEOUT_SEC)
+            tool = get_tool(step.tool_name)
+            if tool is None:
+                raise RuntimeError(f"Unknown tool: {step.tool_name}")
 
-            if err is None:
-                success = True
-                break
+            inp = json.loads(step.input_json)
 
-            last_error = err
-            print(f"[Worker] Attempt {attempt} failed: {err}")
-            time.sleep(0.5 * attempt)  # simple backoff
+            MAX_RETRIES = 3
+            TIMEOUT_SEC = 2.0
 
-        if not success:
-            step.status = StepStatus.FAILED.value
-            step.error_message = last_error
+            attempt = 0
+            success = False
+            last_error = None
+
+            while attempt < MAX_RETRIES:
+                attempt += 1
+
+                # Heartbeat
+                job.updated_at = now()
+                step.updated_at = now()
+                db.commit()
+
+                out, err = run_with_timeout(tool, inp, TIMEOUT_SEC)
+
+                if err is None:
+                    success = True
+                    break
+
+                last_error = err
+                time.sleep(0.5 * attempt)
+
+            if not success:
+                step.status = StepStatus.FAILED.value
+                step.error_message = last_error
+                step.updated_at = now()
+
+                job.status = JobStatus.FAILED.value
+                job.error_message = f"Step {step.tool_name} failed: {last_error}"
+                job.updated_at = now()
+                db.commit()
+                return
+
+            step.output_json = json.dumps(out)
+            step.status = StepStatus.SUCCEEDED.value
             step.updated_at = now()
-
-            job.status = JobStatus.FAILED.value
-            job.error_message = f"Tool {step.tool_name} failed after retries: {last_error}"
-            job.updated_at = now()
-
             db.commit()
-            return
 
-        # Success
-        step.output_json = json.dumps(out)
-        step.status = StepStatus.SUCCEEDED.value
-        step.updated_at = now()
+            previous_output = out
+        
+        job.result_text = json.dumps(previous_output, indent=2)
+        job.status = JobStatus.SUCCEEDED.value
+        job.updated_at = now()
+        db.commit()
+
+        print(f"[Worker] Job {job_id} completed multi-step workflow.")
 
     except Exception as e:
         # Hard failure: mark job failed

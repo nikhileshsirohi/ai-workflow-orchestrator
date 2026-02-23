@@ -109,6 +109,11 @@ def run_job(job_id: int) -> None:
             attempt += 1
             print(f"[Worker] Job {job_id} Step {step.id} attempt {attempt}")
 
+             # HEARTBEAT: show progress so reaper doesn't kill active jobs
+            job.updated_at = now()
+            step.updated_at = now()
+            db.commit()
+
             out, err = run_with_timeout(tool, inp, TIMEOUT_SEC)
 
             if err is None:

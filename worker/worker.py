@@ -9,7 +9,7 @@ from matplotlib.pyplot import step
 
 import redis
 
-from sqlalchemy import update
+from sqlalchemy import update, select
 from database.db import SessionLocal
 from app.models import Job, JobStatus, Step, StepStatus
 from tools.registry import get_tool
@@ -47,31 +47,47 @@ def run_with_timeout(fn, inp: dict, timeout_sec: float):
 
     return result_container["out"], result_container["err"]
 
+def claim_next_job(db) -> int | None:
+    """
+    Postgres-only safe claim:
+    - locks one QUEUED job row
+    - skips rows locked by other workers
+    - sets it to RUNNING atomically
+    Returns job_id or None.
+    """
+    # Lock one queued job row, skip locked ones
+    stmt = (
+        select(Job)
+        .where(Job.status == JobStatus.QUEUED.value)
+        .order_by(Job.id.asc())
+        .with_for_update(skip_locked=True)
+        .limit(1)
+    )
+
+    job = db.execute(stmt).scalars().first()
+    if not job:
+        return None
+
+    # Claim it
+    job.status = JobStatus.RUNNING.value
+    job.updated_at = now()
+    db.commit()
+
+    return job.id
+
 def run_job(job_id: int) -> None:
     db = SessionLocal()
     try:
-        # Atomic claim: only one worker can move QUEUED -> RUNNING
-        stmt = (
-            update(Job)
-            .where(Job.id == job_id, Job.status == JobStatus.QUEUED.value)
-            .values(status=JobStatus.RUNNING.value, updated_at=now())
-        )
-
-        res = db.execute(stmt)
-        db.commit()
-
-        if res.rowcount == 0:
-            # Someone else already claimed it OR it doesn't exist OR it is already done.
-            job = db.query(Job).filter(Job.id == job_id).first()
-            if not job:
-                print(f"[Worker] Job {job_id} not found. Skipping.")
-            else:
-                print(f"[Worker] Job {job_id} not claimable (status={job.status}). Skipping.")
-            return
-
         # Re-fetch the job after claim
         job = db.query(Job).filter(Job.id == job_id).first()
+        if not job:
+            print(f"[Worker] Job {job_id} not found. Skipping.")
+            return
 
+        if job.status != JobStatus.RUNNING.value:
+            print(f"[Worker] Job {job_id} unexpected status={job.status}. Skipping.")
+            return
+        
         # For MVP: define a fixed workflow = one step: echo
         # Define workflow plan (static for now)
         workflow_plan = [
@@ -113,6 +129,9 @@ def run_job(job_id: int) -> None:
                 raise RuntimeError(f"Unknown tool: {step.tool_name}")
 
             inp = json.loads(step.input_json)
+            # pass previous step output forward
+            if previous_output is not None:
+                inp["prev_output"] = previous_output
 
             MAX_RETRIES = 3
             TIMEOUT_SEC = 2.0
@@ -193,6 +212,20 @@ def main():
 
         run_job(job_id)
 
+def main():
+    print("[Worker] Starting DB-atomic worker. Polling DB for queued jobs... (Ctrl+C to stop)")
+    while True:
+        db = SessionLocal()
+        try:
+            job_id = claim_next_job(db)
+        finally:
+            db.close()
+
+        if job_id is None:
+            time.sleep(0.5)  # no jobs, sleep briefly
+            continue
+
+        run_job(job_id)
 
 if __name__ == "__main__":
     main()

@@ -13,6 +13,7 @@ from sqlalchemy import update, select
 from database.db import SessionLocal
 from app.models import Job, JobStatus, Step, StepStatus
 from tools.registry import get_tool
+from tools.planner import plan_workflow
 
 REDIS_URL = "redis://localhost:6379/0"
 QUEUE_NAME = "job_queue"
@@ -88,30 +89,31 @@ def run_job(job_id: int) -> None:
             print(f"[Worker] Job {job_id} unexpected status={job.status}. Skipping.")
             return
         
-        # For MVP: define a fixed workflow = one step: echo
-        # Define workflow plan (static for now)
-        workflow_plan = [
-            {
-                "tool_name": "echo",
-                "input": {"text": job.request_text}
-            },
-            {
-                "tool_name": "unstable",
-                "input": {"sleep_sec": 0.5, "fail_prob": 0.3}
-            },
-            {
-                "tool_name": "echo",
-                "input": {"final": "processing completed"}
-            }
-        ]
+        workflow_plan, plan_err = plan_workflow(job.request_text)
+        if plan_err is not None:
+            job.status = JobStatus.FAILED.value
+            job.error_message = f"Planner failed: {plan_err}"
+            job.updated_at = now()
+            db.commit()
+            print(f"[Worker] Job {job_id} planner failed: {plan_err}")
+            return
+        
         previous_output = None
-
+        
         for step_def in workflow_plan:
+            tool_name = step_def.get("tool_name")
+            tool_input = step_def.get("input")
+
+            if tool_name is None or not isinstance(tool_name, str):
+                raise RuntimeError(f"Planner produced invalid step tool_name: {step_def}")
+            if tool_input is None or not isinstance(tool_input, dict):
+                raise RuntimeError(f"Planner produced invalid step input: {step_def}")
+            
             step = Step(
                 job_id=job.id,
                 status=StepStatus.PENDING.value,
-                tool_name=step_def["tool_name"],
-                input_json=json.dumps(step_def["input"]),
+                tool_name=tool_name,
+                input_json=json.dumps(tool_input),
                 created_at=now(),
                 updated_at=now(),
             )
@@ -175,7 +177,11 @@ def run_job(job_id: int) -> None:
 
             previous_output = out
         
-        job.result_text = json.dumps(previous_output, indent=2)
+        # job.result_text = json.dumps(previous_output, indent=2)
+        job.result_text = json.dumps(
+            {"planned_steps": workflow_plan, "final_output": previous_output},
+            indent=2
+        )
         job.status = JobStatus.SUCCEEDED.value
         job.updated_at = now()
         db.commit()

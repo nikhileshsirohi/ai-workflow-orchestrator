@@ -14,5 +14,9 @@ QUEUE_NAME = os.getenv("QUEUE_NAME", "job_queue")
 MAX_RETRIES = int(os.getenv("MAX_RETRIES", "3"))
 TOOL_TIMEOUT_SEC = float(os.getenv("TOOL_TIMEOUT_SEC", "2.0"))
 
+# Ollama
+OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3.2:3b")
+
 # Reaper
 REAPER_STALE_MINUTES = int(os.getenv("REAPER_STALE_MINUTES", "2"))
